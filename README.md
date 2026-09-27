@@ -25,6 +25,6 @@ Data hanya ada di browser tempat aplikasi dibuka, jadi ekspor JSON secara rutin 
 | `index.html` | Kerangka halaman dan tab bar |
 | `app.js` | Jadwal default, penyimpanan, aturan streak/peringatan, tiga tampilan |
 | `style.css` | Tampilan mobile-first, terang/gelap mengikuti sistem |
-| `sw.js`, `manifest.webmanifest`, `icon.svg`, `icon-*.png` | PWA (bisa dipasang dan dipakai offline) |
+| `sw.js`, `manifest.webmanifest`, `icon.svg`, `icon-*.png`, `apple-touch-icon.png` | PWA (bisa dipasang dan dipakai offline) |
 
 Batas-batas (maks. game ML, jam 22.00, 30 menit Anki, target hari kacau) ada sebagai konstanta di bagian atas `app.js`.
