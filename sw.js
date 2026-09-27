@@ -1,5 +1,5 @@
 // Network-first: perubahan kode langsung terlihat saat online, cache dipakai saat offline.
-const CACHE = 'daily-v3';
+const CACHE = 'daily-v4';
 const ASSETS = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', event => {
@@ -15,6 +15,8 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
+  // Data sinkron (GitHub API) tidak boleh di-cache: berisi token & data pribadi, dan harus selalu segar.
+  if (new URL(event.request.url).hostname === 'api.github.com') return;
   event.respondWith(
     fetch(event.request)
       .then(response => {

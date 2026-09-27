@@ -1,7 +1,8 @@
 # Rutinitas Harian
 
 Aplikasi web statis (HTML/JS/CSS) untuk melacak rutinitas harian. Tanpa server dan tanpa login.
-Data tersimpan di `localStorage` browser, dan bisa diekspor/impor sebagai JSON dari tab **Jadwal**.
+Data tersimpan di `localStorage` browser. Dari tab **Jadwal**, data bisa diekspor/impor sebagai JSON, atau
+disinkronkan ke repo GitHub privat (butuh fine-grained token) supaya bisa dibaca dan diubah lewat chat dengan Claude.
 
 ## Menjalankan secara lokal
 

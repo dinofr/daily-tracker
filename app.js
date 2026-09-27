@@ -52,12 +52,18 @@ function load() {
   return { template: structuredClone(DEFAULT_TEMPLATE), days: {} };
 }
 
-function save() {
+function saveLocal() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   } catch (err) {
     alert(`Gagal menyimpan data: ${err.message}`);
   }
+}
+
+// Simpan lokal lalu jadwalkan sinkron ke repo (jika terhubung).
+function save() {
+  saveLocal();
+  scheduleSync();
 }
 
 let data = load();
@@ -95,7 +101,7 @@ function entryFromBlock(b) {
 
 function ensureDay(key) {
   if (!data.days[key]) {
-    data.days[key] = { chaos: false, entries: data.template.map(entryFromBlock) };
+    data.days[key] = { chaos: false, structureAt: Date.now(), entries: data.template.map(entryFromBlock) };
     save();
   }
   return data.days[key];
@@ -105,6 +111,7 @@ function ensureDay(key) {
 function syncDayWithTemplate(key) {
   const day = data.days[key];
   if (!day) return;
+  day.structureAt = Date.now();
   day.entries = data.template.map(b => {
     const fresh = entryFromBlock(b);
     const old = day.entries.find(e => e.blockId === b.id);
@@ -264,6 +271,7 @@ function renderToday() {
       <div>
         <p class="eyebrow">${isToday ? 'Hari ini' : 'Kemarin'}</p>
         <h1>${formatLong(key)}</h1>
+        ${syncLabelHtml()}
       </div>
       <button type="button" class="ghost small" data-act="switch-day">${isToday ? '‹ Kemarin' : 'Hari ini ›'}</button>
     </header>
@@ -297,6 +305,7 @@ el.today.addEventListener('click', ev => {
   } else if (act === 'chaos') {
     const day = currentDay();
     day.chaos = !day.chaos;
+    day.chaosAt = Date.now();
     save();
     renderToday();
   }
@@ -306,6 +315,7 @@ el.today.addEventListener('change', ev => {
   if (ev.target.dataset.act !== 'done') return;
   const e = currentDay().entries[ev.target.closest('li').dataset.i];
   e.done = ev.target.checked;
+  e.updatedAt = Date.now();
   if (e.done && e.ml && !e.ml.finishedAt && viewOffset === 0) e.ml.finishedAt = nowHHMM();
   save();
   renderToday();
@@ -320,6 +330,7 @@ el.today.addEventListener('input', ev => {
   const [group, prop] = field.split('.');
   const raw = ev.target.value;
   e[group][prop] = ev.target.type === 'number' ? (raw === '' ? null : Math.max(0, Number(raw))) : raw;
+  e.updatedAt = Date.now();
   save();
 
   if (group === 'ml') {
@@ -377,9 +388,11 @@ function renderSchedule() {
       <button type="button" class="primary" data-act="save" ${isDirty() ? '' : 'disabled'}>Simpan jadwal</button>
     </div>
 
+    ${syncSectionHtml()}
+
     <section class="data-box">
-      <h2>Data</h2>
-      <p class="note">Semua data tersimpan di browser perangkat ini saja. Ekspor secara rutin sebagai cadangan.</p>
+      <h2>Cadangan</h2>
+      <p class="note">Ekspor menyimpan salinan data ke file. Impor menimpa data di perangkat ini${sync.token ? ' dan di repo' : ''}.</p>
       <div class="actions">
         <button type="button" class="ghost" data-act="export">Ekspor JSON</button>
         <label class="ghost button">Impor JSON<input type="file" accept=".json,application/json" data-act="import" hidden></label>
@@ -395,6 +408,7 @@ function saveSchedule() {
     return;
   }
   data.template = structuredClone(draft).sort((a, b) => a.start.localeCompare(b.start));
+  data.templateAt = Date.now();
   syncDayWithTemplate(todayKey());
   save();
   draft = null;
@@ -419,6 +433,21 @@ el.schedule.addEventListener('click', ev => {
     saveSchedule();
   } else if (act === 'export') {
     exportData();
+  } else if (act === 'connect') {
+    const token = document.getElementById('sync-token').value.trim();
+    if (!token) return;
+    sync.token = token;
+    saveSync();
+    renderSchedule();
+    syncNow();
+  } else if (act === 'sync-now') {
+    syncNow();
+  } else if (act === 'disconnect') {
+    if (!confirm('Putuskan sinkronisasi? Data di perangkat ini tetap ada.')) return;
+    sync.token = '';
+    saveSync();
+    setSyncState('off');
+    renderSchedule();
   }
 });
 
@@ -450,10 +479,11 @@ async function importData(file) {
     if (!isValidData(parsed)) throw new Error('Format file tidak dikenali.');
     if (!confirm('Timpa semua data di perangkat ini dengan isi file?')) return;
     data = parsed;
-    save();
+    saveLocal();
     draft = null;
     renderSchedule();
     toast('Data diimpor');
+    syncNow({ force: true }); // impor = timpa, termasuk salinan di repo
   } catch (err) {
     alert(`Gagal impor: ${err.message}`);
   }
@@ -522,6 +552,236 @@ function renderSummary() {
 }
 
 // ---------------------------------------------------------------------------
+// Sinkronisasi ke repo GitHub privat, supaya data bisa dibaca & diubah lewat chat.
+// localStorage tetap salinan kerja (offline tetap jalan); repo adalah salinan bersama.
+// ---------------------------------------------------------------------------
+
+const SYNC_KEY = 'daily-tracker-sync';
+const DATA_REPO = 'dinofr/daily-tracker-data';
+const DATA_PATH = 'data.json';
+const SYNC_DELAY_MS = 3000;
+
+function loadSync() {
+  try {
+    return { token: '', lastSync: 0, ...JSON.parse(localStorage.getItem(SYNC_KEY) || '{}') };
+  } catch {
+    return { token: '', lastSync: 0 };
+  }
+}
+
+function saveSync() {
+  try { localStorage.setItem(SYNC_KEY, JSON.stringify(sync)); } catch { /* abaikan */ }
+}
+
+const sync = loadSync();
+let syncState = sync.token ? 'idle' : 'off'; // off | idle | busy | ok | offline | auth | error
+let syncMessage = '';
+let syncTimer = null;
+let syncRunning = null;
+let syncQueued = false;
+
+class SyncError extends Error {
+  constructor(kind, message) { super(message); this.kind = kind; }
+}
+
+// JSON dengan urutan key tetap, untuk membandingkan isi data.
+function stable(v) {
+  if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
+  if (v && typeof v === 'object') {
+    return `{${Object.keys(v).filter(k => v[k] !== undefined).sort()
+      .map(k => `${JSON.stringify(k)}:${stable(v[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
+}
+
+// Gabung per blok: nilai (centang, isian) yang lebih baru menang. Susunan blok hari itu
+// ikut sisi yang structureAt-nya lebih baru; status hari kacau ikut chaosAt yang lebih baru.
+function mergeDay(a, b) {
+  const base = (b.structureAt || 0) > (a.structureAt || 0) ? b : a;
+  const other = base === a ? b : a;
+  const entries = base.entries.map(e => {
+    const o = other.entries.find(x => x.blockId === e.blockId);
+    if (!o || (o.updatedAt || 0) <= (e.updatedAt || 0)) return e;
+    return {
+      ...e,
+      done: o.done,
+      updatedAt: o.updatedAt,
+      ...(e.anki && o.anki && { anki: o.anki }),
+      ...(e.ml && o.ml && { ml: o.ml }),
+    };
+  });
+  const chaosSrc = (b.chaosAt || 0) > (a.chaosAt || 0) ? b : a;
+  return { ...base, entries, chaos: chaosSrc.chaos, chaosAt: chaosSrc.chaosAt };
+}
+
+function mergeData(local, remote) {
+  const newerTemplate = (remote.templateAt || 0) > (local.templateAt || 0) ? remote : local;
+  const days = {};
+  for (const key of new Set([...Object.keys(local.days), ...Object.keys(remote.days)])) {
+    const a = local.days[key];
+    const b = remote.days[key];
+    days[key] = !a ? b : !b ? a : mergeDay(a, b);
+  }
+  return { ...local, template: newerTemplate.template, templateAt: newerTemplate.templateAt, days };
+}
+
+const toBase64 = str => {
+  let bin = '';
+  for (const byte of new TextEncoder().encode(str)) bin += String.fromCharCode(byte);
+  return btoa(bin);
+};
+const fromBase64 = b64 => new TextDecoder().decode(Uint8Array.from(atob(b64.replace(/\s/g, '')), c => c.charCodeAt(0)));
+
+async function github(method, body) {
+  let res;
+  try {
+    res = await fetch(`https://api.github.com/repos/${DATA_REPO}/contents/${DATA_PATH}`, {
+      method,
+      cache: 'no-store',
+      headers: {
+        Authorization: `Bearer ${sync.token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      body: body && JSON.stringify(body),
+    });
+  } catch {
+    throw new SyncError('offline', 'Tidak ada koneksi');
+  }
+  if (res.status === 401 || res.status === 403) throw new SyncError('auth', 'Token ditolak');
+  return res;
+}
+
+async function pullRemote() {
+  const res = await github('GET');
+  if (res.status === 404) return null; // file belum ada (sinkron pertama)
+  if (!res.ok) throw new SyncError('error', `GitHub ${res.status}`);
+  const json = await res.json();
+  const parsed = JSON.parse(fromBase64(json.content));
+  if (!isValidData(parsed)) throw new SyncError('error', 'Isi data.json di repo tidak valid');
+  return { sha: json.sha, data: parsed };
+}
+
+// false = file di repo sudah berubah sejak ditarik; perlu tarik & gabung ulang.
+async function pushRemote(sha) {
+  const res = await github('PUT', {
+    message: `sync ${todayKey()} ${nowHHMM()}`,
+    content: toBase64(JSON.stringify(data)),
+    ...(sha && { sha }),
+  });
+  if (res.status === 409 || res.status === 422) return false;
+  if (res.status === 404) throw new SyncError('auth', 'Token tidak punya akses ke repo data');
+  if (!res.ok) throw new SyncError('error', `GitHub ${res.status}`);
+  return true;
+}
+
+function scheduleSync(delay = SYNC_DELAY_MS) {
+  if (!sync.token) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncNow, delay);
+}
+
+// force = timpa isi repo dengan data lokal tanpa digabung (dipakai setelah impor).
+function syncNow({ force = false } = {}) {
+  if (!sync.token) return;
+  clearTimeout(syncTimer);
+  syncTimer = null;
+  if (syncRunning) {
+    syncQueued = true;
+    return syncRunning;
+  }
+  setSyncState('busy');
+  syncRunning = (async () => {
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const remote = await pullRemote();
+        if (remote && !force) {
+          const merged = mergeData(data, remote.data);
+          if (stable(merged) !== stable(data)) {
+            data = merged;
+            saveLocal();
+            refreshView();
+          }
+          if (stable(merged) === stable(remote.data)) return syncDone();
+        }
+        if (await pushRemote(remote?.sha)) return syncDone();
+      }
+      throw new SyncError('error', 'data terus berubah, coba lagi');
+    } catch (err) {
+      console.warn('Sinkron gagal', err);
+      setSyncState(err.kind || 'error', err.message);
+    } finally {
+      syncRunning = null;
+      if (syncQueued) {
+        syncQueued = false;
+        scheduleSync(0);
+      }
+    }
+  })();
+  return syncRunning;
+}
+
+function syncDone() {
+  sync.lastSync = Date.now();
+  saveSync();
+  setSyncState('ok');
+}
+
+// Render ulang setelah data dari repo masuk, kecuali pengguna sedang mengetik.
+function refreshView() {
+  if (document.activeElement?.matches('input, select')) return;
+  renderers[activeTab]();
+}
+
+function syncLabel() {
+  switch (syncState) {
+    case 'off': return '';
+    case 'busy': return 'Menyinkronkan…';
+    case 'offline': return 'Offline — disinkronkan nanti';
+    case 'auth': return syncMessage;
+    case 'error': return `Gagal sinkron: ${syncMessage}`;
+    default: {
+      if (!sync.lastSync) return 'Belum pernah sinkron';
+      const d = new Date(sync.lastSync);
+      const time = d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      return toKey(d) === todayKey() ? `Tersinkron ${time}` : `Tersinkron ${formatShort(toKey(d))} ${time}`;
+    }
+  }
+}
+
+const syncLabelHtml = () => `<p class="sync-label" data-sync-label data-state="${syncState}">${esc(syncLabel())}</p>`;
+
+function setSyncState(state, message = '') {
+  syncState = state;
+  syncMessage = message;
+  document.querySelectorAll('[data-sync-label]').forEach(node => {
+    node.textContent = syncLabel();
+    node.dataset.state = state;
+  });
+}
+
+function syncSectionHtml() {
+  if (!sync.token) {
+    return `<section class="data-box">
+      <h2>Sinkronisasi</h2>
+      <p class="note">Salin data ke repo privat <strong>${DATA_REPO}</strong> supaya bisa dibaca dan diubah lewat chat dengan Claude.
+        Butuh <em>fine-grained token</em> GitHub dengan akses hanya ke repo itu (Contents: Read and write).</p>
+      <input type="password" class="title-input" id="sync-token" placeholder="github_pat_…" autocomplete="off" spellcheck="false" aria-label="Token GitHub">
+      <div class="actions"><button type="button" class="primary" data-act="connect">Hubungkan &amp; sinkronkan</button></div>
+    </section>`;
+  }
+  return `<section class="data-box">
+    <h2>Sinkronisasi</h2>
+    <p class="note">Terhubung ke <strong>${DATA_REPO}</strong>.</p>
+    ${syncLabelHtml()}
+    <div class="actions">
+      <button type="button" class="ghost" data-act="sync-now">Sinkronkan sekarang</button>
+      <button type="button" class="ghost danger" data-act="disconnect">Putuskan</button>
+    </div>
+  </section>`;
+}
+
+// ---------------------------------------------------------------------------
 // Navigasi, toast, inisialisasi
 // ---------------------------------------------------------------------------
 
@@ -542,10 +802,17 @@ document.querySelector('.tabbar').addEventListener('click', ev => {
   if (tab) showTab(tab);
 });
 
-// Aplikasi dibiarkan terbuka melewati tengah malam: render ulang saat kembali dibuka.
+// Saat kembali dibuka: render ulang (bisa sudah lewat tengah malam) dan tarik perubahan dari repo.
+// Saat ditutup: kirim perubahan yang masih menunggu.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && activeTab !== 'schedule') renderers[activeTab]();
+  if (document.visibilityState === 'visible') {
+    if (activeTab !== 'schedule') renderers[activeTab]();
+    syncNow();
+  } else if (syncTimer) {
+    syncNow();
+  }
 });
+window.addEventListener('online', () => syncNow());
 
 let toastTimer;
 function toast(msg) {
@@ -562,3 +829,4 @@ if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
 }
 
 showTab('today');
+syncNow();

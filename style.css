@@ -278,6 +278,12 @@ button, input, select { font: inherit; color: inherit; }
 .actions.sticky button { box-shadow: 0 4px 14px rgb(0 0 0 / .18); }
 .data-box { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
 .data-box .actions { justify-content: flex-start; }
+.data-box .title-input { margin-bottom: 10px; }
+.data-box .sync-label { margin: -6px 0 12px; }
+
+.sync-label { margin: 4px 0 0; font-size: .75rem; color: var(--muted); }
+.sync-label:empty { display: none; }
+.sync-label[data-state="auth"], .sync-label[data-state="error"] { color: var(--shu); font-weight: 700; }
 
 /* ---------- Ringkasan ---------- */
 
